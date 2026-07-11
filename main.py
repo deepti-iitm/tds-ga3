@@ -17,8 +17,7 @@ HEAD = {"Authorization": f"Bearer {config.AIPIPE_TOKEN}",
 _CACHE = {}
 def _ck(*parts):
     return hashlib.sha256("||".join(map(str, parts)).encode()).hexdigest()
-import asyncio
-async def chat(messages, model=None, max_tokens=800, force_json=True, retries=4):
+async def chat(messages, model=None, max_tokens=800, force_json=True):
     key = _ck("chat", model, json.dumps(messages, sort_keys=True, default=str))
     if key in _CACHE:
         return _CACHE[key]
@@ -26,54 +25,13 @@ async def chat(messages, model=None, max_tokens=800, force_json=True, retries=4)
             "temperature": 0, "max_tokens": max_tokens}
     if force_json:
         body["response_format"] = {"type": "json_object"}
-    last_err = None
     async with httpx.AsyncClient(timeout=90) as c:
-        for attempt in range(retries):
-            r = await c.post(f"{config.AIPIPE_BASE}/chat/completions",
-                             headers=HEAD, json=body)
-            if r.status_code in (429, 500, 502, 503, 504):
-                last_err = f"HTTP {r.status_code}: {r.text[:160]}"
-                await asyncio.sleep(1.5 * (attempt + 1))   # backoff and retry
-                continue
-            r.raise_for_status()
-            out = r.json()["choices"][0]["message"]["content"]
-            _CACHE[key] = out
-            return out
-    raise RuntimeError(f"chat failed after {retries} retries: {last_err}")
-# Gemini models to try in order for audio transcription. If one is overloaded (503)
-# or rate-limited (429), we retry it, then fall through to the next.
-GEMINI_MODELS = ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash",
-                 "gemini-flash-latest"]
-
-async def gemini_transcribe(payload, attempts_per_model=3):
-    global last_debug_info
-    last_err = ""
-    async with httpx.AsyncClient(timeout=120) as c:
-        for model in GEMINI_MODELS:
-            for attempt in range(attempts_per_model):
-                try:
-                    r = await c.post(
-                        f"https://aipipe.org/geminiv1beta/models/{model}:generateContent",
-                        headers={"Authorization": f"Bearer {config.AIPIPE_TOKEN}"},
-                        json=payload)
-                    if r.status_code in (429, 500, 502, 503, 504):
-                        last_err = f"HTTP {r.status_code} on {model}: {r.text[:160]}"
-                        await asyncio.sleep(1.5 * (attempt + 1))   # backoff
-                        continue
-                    r.raise_for_status()
-                    data = r.json()
-                    txt = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                    last_debug_info["transcribe_model"] = model
-                    return txt
-                except (KeyError, IndexError):
-                    last_err = f"empty candidates on {model}"
-                    break   # model answered but no text -> try next model
-                except Exception as e:
-                    last_err = f"{type(e).__name__} on {model}: {str(e)[:160]}"
-                    await asyncio.sleep(1.0 * (attempt + 1))
-    last_debug_info["transcribe_error"] = last_err
-    return ""
-
+        r = await c.post(f"{config.AIPIPE_BASE}/chat/completions",
+                         headers=HEAD, json=body)
+        r.raise_for_status()
+        out = r.json()["choices"][0]["message"]["content"]
+    _CACHE[key] = out
+    return out
 def parse_json(s):
     s = s.strip()
     if s.startswith("```"):
@@ -115,30 +73,24 @@ async def answer_image(request: Request):
         "role": "user",
         "content": [
             {"type": "text", "text":
-                "You read charts, receipts, tables, invoices and pie charts EXACTLY.\n"
-                "Work in steps in a 'work' field, then give the final 'answer':\n"
-                "1. TRANSCRIBE every relevant label and number you see, one by one "
-                "(e.g. each bar's value, each receipt line, each table cell). Read "
-                "digits carefully; do not round or estimate.\n"
-                "2. If the question needs arithmetic (sum of all bars, grand total, "
-                "max/min of a column, total including tax), compute it step by step "
-                "and DOUBLE-CHECK the sum by re-adding.\n"
-                "3. Final 'answer': if NUMERIC, output ONLY the bare number — no "
-                "currency symbol, no thousands separators, no units, no words. Keep "
-                "decimals exactly as shown (e.g. a money total 4089.35 stays 4089.35). "
-                "If TEXT (e.g. the largest pie category), output it EXACTLY as written "
-                "in the image.\n"
-                "Return JSON: {\"work\": \"...\", \"answer\": \"...\"}.\n"
+                "You are a precise data-extraction assistant. Look at the image and "
+                "answer the question. If the answer is a NUMBER, read every digit "
+                "carefully and COMPUTE step by step if needed (e.g. sum all bars), "
+                "then return ONLY the bare number — no currency symbol, no thousands "
+                "separators, no units, no extra words. If the answer is TEXT (e.g. a "
+                "category name), return it exactly as written in the image. "
+                "Return JSON: {\"answer\": \"...\"}.\n"
                 f"Question: {question}"},
             {"type": "image_url",
-             "image_url": {"url": f"data:image/png;base64,{img_b64}", "detail": "high"}},
+             "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
         ],
     }]
     try:
-        # Full gpt-4o at high image detail reads small chart/receipt labels accurately.
-        out = parse_json(await chat(messages, model=config.VISION_MODEL, max_tokens=1200))
+        # Full gpt-4o reads charts/receipts far more accurately than mini.
+        out = parse_json(await chat(messages, model=config.VISION_MODEL, force_json=False ))
         ans = normalize_answer(out.get("answer", ""))
     except Exception as e:
+        print(e)
         ans = ""
     return {"answer": str(ans)}
 # ================= Q3 + Q7: /extract =================
@@ -372,22 +324,34 @@ async def answer_audio(request: Request):
         last_audio_mime = mime
         last_debug_info["detected_mime"] = mime
 
-        # AIPipe's OpenAI /audio/transcriptions is broken; Gemini handles audio in JSON.
-        # Gemini can return 503 ("model overloaded") under load, so RETRY with backoff
-        # and FALL BACK across several Gemini models until one answers.
-        payload = {
-            "contents": [{
-                "parts": [
-                    {"text": "Transcribe this audio precisely in Korean. Output ONLY the Korean transcription, nothing else."},
-                    {"inlineData": {"mimeType": mime, "data": audio_b64}}
-                ]
-            }]
-        }
-        transcript = await gemini_transcribe(payload)
+        async with httpx.AsyncClient(timeout=120) as c:
+            # HACK: AIPipe's OpenAI proxy for /audio/transcriptions is broken (it forwards JSON which OpenAI rejects).
+            # We must use Gemini 2.5 Flash Lite instead, which natively supports audio in JSON format.
+            payload = {
+                "contents": [{
+                    "parts": [
+                        {"text": "Transcribe this audio precisely in Korean. Output ONLY the Korean transcription, nothing else."},
+                        {"inlineData": {"mimeType": mime, "data": audio_b64}}
+                    ]
+                }]
+            }
+            # Note: config.AIPIPE_BASE includes '/openai/v1', so we use the base domain directly
+            r = await c.post("https://aipipe.org/geminiv1beta/models/gemini-2.5-flash-lite:generateContent",
+                             headers={"Authorization": f"Bearer {config.AIPIPE_TOKEN}"},
+                             json=payload)
+            r.raise_for_status()
+            gemini_resp = r.json()
+            try:
+                transcript = gemini_resp["candidates"][0]["content"]["parts"][0]["text"].strip()
+            except (KeyError, IndexError):
+                transcript = ""
+    except httpx.HTTPStatusError as e:
+        transcript = ""
+        last_debug_info["exception"] = f"HTTP {e.response.status_code}: {e.response.text}"
     except Exception as e:
         transcript = ""
         last_debug_info["exception"] = str(e)
-
+    
     last_debug_info["transcript"] = transcript
 
     # Step 1: LLM extracts structured data AND identifies requested statistics
@@ -439,11 +403,7 @@ async def answer_audio(request: Request):
         "\"positive\"|\"negative\"} — one per stated relationship. When the audio says "
         "'A와 B는 양의 상관관계' put both column names in 'columns' AND emit "
         "explicit_stats.correlation=[{\"x\":\"A\",\"y\":\"B\",\"type\":\"positive\"}]. "
-        "'양의'/비례=positive, '음의'/반비례=negative. NEVER output a correlation matrix.\n"
-        "6. If the transcript states a constraint like '값은 0에서 1 사이입니다', you MUST "
-        "extract the subject ('값', '점수', etc.) as the column name into the 'columns' "
-        "list, AND map the constraint to it in 'explicit_stats' (e.g. value_range: {'값': [0, 1]}). "
-        "NEVER leave 'columns' empty if a constraint is mentioned.\n\n"
+        "'양의'/비례=positive, '음의'/반비례=negative. NEVER output a correlation matrix.\n\n"
         f"TRANSCRIPT:\n{transcript}"
     )
     columns, data_rows, req_stats, num_rows, explicit_stats = [], [], [], None, {}
@@ -529,7 +489,7 @@ async def answer_audio(request: Request):
         if not v:
             continue
         cols_vals.append(v)
-
+        
         if "mean" in req_stats: out["mean"][name] = mean(v)
         if "std" in req_stats: out["std"][name] = pstdev(v) if len(v) > 1 else 0.0
         if "variance" in req_stats: out["variance"][name] = pvariance(v) if len(v) > 1 else 0.0
@@ -580,7 +540,7 @@ async def answer_audio(request: Request):
                                       "type": "negative" if num < 0 else "positive"})
     if corr_list:
         out["correlation"] = corr_list
-
+        
     # ---- Decide the EXACT set of stats the grader wants (the whole ballgame) ----
     # The model sets requested_stats to the FULL list as its "nothing specific was
     # asked, only a constraint was stated" signal. In that case the grader wants
