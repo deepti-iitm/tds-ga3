@@ -1,6 +1,6 @@
 # The only two things you must fill in:
 EMAIL = "23f2005361@ds.study.iitm.ac.in"
-AIPIPE_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6IjIzZjIwMDUzNjFAZHMuc3R1ZHkuaWl0bS5hYy5pbiIsImlhdCI6MTc4MjQ1NzI3NiwiaXNzIjoiaHR0cHM6Ly9haXBpcGUub3JnIiwiYXVkIjoiYWlwaXBlLWFwaSIsImV4cCI6MTc4MzA2MjA3Nn0.foQoQ8D5_WKslQyNc65oQTI7xn1-lqItna1g4UZSnSU"
+AIPIPE_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6IjIzZjIwMDUzNjFAZHMuc3R1ZHkuaWl0bS5hYy5pbiIsImlhdCI6MTc4MjAyMTMyOCwiaXNzIjoiaHR0cHM6Ly9haXBpcGUub3JnIiwiYXVkIjoiYWlwaXBlLWFwaSIsImV4cCI6MTc4MjYyNjEyOH0.8Ll2ZXZJ7drXxN-k1o8kd_NjKOJjbUi23jUqJlsiDqA"
 # Fixed — do not change
 AIPIPE_BASE = "https://aipipe.org/openai/v1"
 TEXT_MODEL = "gpt-4o-mini"
